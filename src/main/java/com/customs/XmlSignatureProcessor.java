@@ -2,9 +2,7 @@ package com.customs;
 
 import org.apache.xml.security.Init;
 import org.apache.xml.security.c14n.Canonicalizer;
-import org.w3c.dom.Document;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
+import org.w3c.dom.*;
 import org.w3c.dom.bootstrap.DOMImplementationRegistry;
 import org.w3c.dom.ls.DOMImplementationLS;
 import org.w3c.dom.ls.LSSerializer;
@@ -25,6 +23,7 @@ import java.nio.file.Files;
 import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
 import java.security.PublicKey;
+import java.security.Signature;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
@@ -47,7 +46,7 @@ class XmlSignatureProcessor {
      */
     private static DocumentBuilderFactory createDocumentBuilderFactory() {
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
+        dbf.setNamespaceAware(true); // Важно: оставляем true для начального парсинга SOAP
         dbf.setIgnoringElementContentWhitespace(false);
         return dbf;
     }
@@ -125,8 +124,52 @@ class XmlSignatureProcessor {
     }
 
     /**
+     * Рекурсивно удаляет пространства имен из узла и его потомков.
+     * Создает новые узлы без префиксов и атрибутов xmlns.
+     * @param node Исходный узел.
+     * @param document Документ, к которому будут принадлежать новые узлы.
+     * @return Новый узел без пространств имен.
+     */
+    private static Node removeNamespacesRecursive(Node node, Document document) {
+        if (node.getNodeType() == Node.ELEMENT_NODE) {
+            Element newElement = document.createElement(node.getLocalName());
+
+            NamedNodeMap attributes = node.getAttributes();
+            for (int i = 0; i < attributes.getLength(); i++) {
+                Node attr = attributes.item(i);
+                if (!attr.getNodeName().startsWith("xmlns") && attr.getNamespaceURI() == null) {
+                    newElement.setAttribute(attr.getLocalName(), attr.getNodeValue());
+                }
+            }
+
+            NodeList children = node.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                newElement.appendChild(removeNamespacesRecursive(children.item(i), document));
+            }
+            return newElement;
+        } else {
+            return document.importNode(node, true);
+        }
+    }
+
+    /**
+     * Создает новый XML-документ, в котором удалены все пространства имен из исходного узла.
+     * @param sourceNode Исходный узел, из которого нужно удалить пространства имен.
+     * @return Новый XML-документ без пространств имен.
+     * @throws ParserConfigurationException если возникла ошибка конфигурации парсера.
+     */
+    private static Document removeAllNamespaces(Node sourceNode) throws ParserConfigurationException {
+        DocumentBuilder db = createDocumentBuilder();
+        Document doc = db.newDocument();
+
+        Node newNode = removeNamespacesRecursive(sourceNode, doc);
+        doc.appendChild(newNode);
+        return doc;
+    }
+
+    /**
      * Выполняет канонизацию SOAP Body, имитируя поведение Exchange кода.
-     * Каждый дочерний элемент Body обрабатывается как отдельный документ.
+     * Каждый дочерний элемент Body обрабатывается как отдельный документ после удаления пространств имен.
      *
      * @param fullSoapXml Полный XML-документ SOAP.
      * @return Канонизированные байты.
@@ -144,26 +187,20 @@ class XmlSignatureProcessor {
             throw new Exception("SOAP Body element not found at /soap:Envelope/soap:Body.");
         }
 
-        LSSerializer serializer = getLSSerializer();
         Canonicalizer canon = Canonicalizer.getInstance(Canonicalizer.ALGO_ID_C14N_OMIT_COMMENTS);
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ByteArrayOutputStream finalStream = new ByteArrayOutputStream();
 
         NodeList bodyChildren = bodyNode.getChildNodes();
         for (int i = 0; i < bodyChildren.getLength(); i++) {
             Node node = bodyChildren.item(i);
 
             if (node.getNodeType() == Node.ELEMENT_NODE) {
-                String outerXmlContent = serializer.writeToString(node);
-
-                // Создаем новый временный Document из OuterXml
-                // Это заставляет канонизатор обрабатывать каждый фрагмент как отдельный корневой элемент
-                Document tempDoc = db.parse(new ByteArrayInputStream(outerXmlContent.getBytes(StandardCharsets.UTF_8)));
-
-                // Канонизируем корневой элемент этого временного документа
-                canon.canonicalizeSubtree(tempDoc.getDocumentElement(), baos);
+                Document tempDoc = removeAllNamespaces(node);
+                canon.canonicalizeSubtree(tempDoc.getDocumentElement(), finalStream);
             }
         }
-        return baos.toByteArray();
+
+        return finalStream.toByteArray();
     }
 
     /**
@@ -200,7 +237,7 @@ class XmlSignatureProcessor {
         PublicKey publicKey = loadPublicKeyFromPem(publicKeyFile);
 
         byte[] signatureBytes = Base64.getDecoder().decode(signatureBase64);
-        java.security.Signature signature = java.security.Signature.getInstance("SHA512withRSA");
+        Signature signature = Signature.getInstance("SHA512withRSA");
         signature.initVerify(publicKey);
         signature.update(canonicalBytes);
         return signature.verify(signatureBytes);
